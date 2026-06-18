@@ -38,6 +38,7 @@ from paroquant.optim.util import (
     to_device,
 )
 from paroquant.optim.rotation import transform_to_kernel_data
+from paroquant.optim.streaming import StreamingModelLoader, materialize_nonlayer, move_real_tensors
 
 
 @dataclass(kw_only=True)
@@ -108,6 +109,13 @@ class Config:
     # Optional smoke/debug limit: optimize only the first N transformer layers.
     # Full artifacts should leave this unset.
     max_layers: int | None = None
+
+    # Stream the model from disk one layer at a time instead of holding the whole
+    # model in host RAM. Decoder layers stay on the meta device and are
+    # materialized (with block-FP8 dequantization) just before they are
+    # optimized, then released. Required to optimize models that do not fit in
+    # RAM (e.g. block-FP8 MoE checkpoints such as MiniMax-M2 / DeepSeek).
+    stream_from_disk: bool = False
 
     seed: int
 
@@ -191,8 +199,15 @@ def main():
         json.dump(vars(args), f, indent=2)
 
     # Load model.
-    model = load_model(args.model, device_map="cpu", dtype=torch.float16).half()
-    move_embed(model, device)
+    weight_loader = None
+    if args.stream_from_disk:
+        logger.info("Streaming model from disk (per-layer FP8 dequant); decoder layers stay on meta.")
+        weight_loader = StreamingModelLoader(args.model, dtype=torch.float16)
+        model = weight_loader.build_meta_model()
+        materialize_nonlayer(weight_loader, model)
+    else:
+        model = load_model(args.model, device_map="cpu", dtype=torch.float16).half()
+        move_embed(model, device)
     tokenizer = load_tokenizer(args.model)
     blocks = get_blocks(model)
 
@@ -219,7 +234,11 @@ def main():
 
     # Capture per-batch positional args and layer kwargs.
     logger.info("Capturing layer positional args and kwargs...")
-    model.to(device)
+    if weight_loader is not None:
+        # Decoder layers are on meta; only move the real (non-layer) tensors.
+        move_real_tensors(model, device)
+    else:
+        model.to(device)
     (
         og_layer_input_batches,
         kwargs_list,
@@ -249,7 +268,10 @@ def main():
     new_retained_kwargs_batches = deepcopy(og_retained_kwargs_batches)
     new_val_retained_kwargs_batches = deepcopy(og_val_retained_kwargs_batches)
 
-    model.cpu()
+    if weight_loader is not None:
+        move_real_tensors(model, "cpu")
+    else:
+        model.cpu()
 
     del samples, val_samples
     empty_cache()
@@ -333,6 +355,9 @@ def main():
 
     for layer_idx, layer in enumerate(tqdm(blocks_to_optimize)):
         empty_cache()
+        if weight_loader is not None:
+            # Materialize this layer's weights from disk (block-FP8 dequant).
+            weight_loader.materialize(layer, f"model.layers.{layer_idx}")
         layer_eval_dtype = next(layer.parameters()).dtype
         logger.info(f"Capturing original layer output...")
         # Original output of this layer.
@@ -667,6 +692,8 @@ def main():
 
         if all_files_exist:
             layer.cpu()
+            if weight_loader is not None:
+                weight_loader.release(layer)
             continue
 
         # Save the optimized result
@@ -678,6 +705,8 @@ def main():
             )
 
         layer.cpu()
+        if weight_loader is not None:
+            weight_loader.release(layer)
 
     cleanup_activation_batches(og_layer_input_batches)
     cleanup_activation_batches(og_layer_val_input_batches)

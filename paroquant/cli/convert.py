@@ -14,7 +14,8 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoModelForImageTextToText
 
 from paroquant.optim.qexperts import PseudoQuantizedMoEExperts, get_named_moe_experts, is_fused_moe_experts
-from paroquant.optim.util import get_named_linears, set_module_by_name
+from paroquant.optim.util import get_named_linears, set_module_by_name, get_blocks, logger
+from paroquant.optim.streaming import StreamingModelLoader, materialize_nonlayer
 
 
 _AWQ_REORDER = (0, 2, 4, 6, 1, 3, 5, 7)
@@ -484,6 +485,126 @@ def _convert_real(
     return count, quant_config, final_sd
 
 
+class _ShardedSafetensorWriter:
+    """Writes tensors to size-capped safetensors shards + an index.json.
+
+    Keeps only the current (sub-cap) shard in RAM, so a model far larger than
+    host RAM can be written incrementally.
+    """
+
+    def __init__(self, out_dir: Path, *, max_shard_bytes: int = 5 * 1024**3):
+        self.out_dir = out_dir
+        self.max_shard_bytes = max_shard_bytes
+        self._cur: dict[str, torch.Tensor] = {}
+        self._cur_bytes = 0
+        self._tmp_names: list[str] = []
+        self._weight_map: dict[str, str] = {}
+        self._total_bytes = 0
+
+    def add(self, name: str, tensor: torch.Tensor) -> None:
+        t = tensor.detach().contiguous().cpu()
+        nbytes = t.numel() * t.element_size()
+        if self._cur and self._cur_bytes + nbytes > self.max_shard_bytes:
+            self._flush()
+        self._cur[name] = t
+        self._cur_bytes += nbytes
+        self._total_bytes += nbytes
+
+    def _flush(self) -> None:
+        tmp = f"model-{len(self._tmp_names):05d}.safetensors"
+        save_safetensors(self._cur, str(self.out_dir / tmp), metadata={"format": "pt"})
+        for key in self._cur:
+            self._weight_map[key] = tmp
+        self._tmp_names.append(tmp)
+        self._cur = {}
+        self._cur_bytes = 0
+
+    def finalize(self) -> None:
+        if self._cur:
+            self._flush()
+        total = len(self._tmp_names)
+        # Rename to the conventional model-XXXXX-of-YYYYY.safetensors.
+        rename = {tmp: f"model-{i:05d}-of-{total:05d}.safetensors" for i, tmp in enumerate(self._tmp_names)}
+        for tmp, final in rename.items():
+            (self.out_dir / tmp).rename(self.out_dir / final)
+        weight_map = {k: rename[v] for k, v in self._weight_map.items()}
+        index = {"metadata": {"total_size": self._total_bytes}, "weight_map": weight_map}
+        (self.out_dir / "model.safetensors.index.json").write_text(json.dumps(index, indent=2) + "\n")
+
+
+@torch.no_grad()
+def _convert_real_streaming(
+    source_dir: Path,
+    result_dir: Path,
+    output_path: Path,
+) -> tuple[int, dict[str, Any] | None]:
+    """Streaming, sharded, quantized-only real conversion for models too large for RAM.
+
+    Decoder layers are materialized one at a time (with block-FP8 dequant) only to
+    read module shapes and the fp16 weights of *non-quantized* modules (norms). Each
+    quantized ``nn.Linear`` is replaced by a ``RotateQuantizedLinear`` built from its
+    ``.pt`` result; the redundant fp16 ``.weight`` is dropped. Output is written as
+    size-capped safetensors shards + index.json.
+    """
+    from paroquant.inference.backends.transformers.modules import RotateQuantizedLinear
+
+    output_path.mkdir(parents=True, exist_ok=True)
+    loader = StreamingModelLoader(str(source_dir), dtype=torch.float16)
+    model = loader.build_meta_model()
+    materialize_nonlayer(loader, model)
+    blocks = get_blocks(model)
+
+    writer = _ShardedSafetensorWriter(output_path)
+
+    # Non-layer tensors (embed, final norm, lm_head) stay fp16.
+    for name, param in model.named_parameters(recurse=True):
+        if ".layers." in name or param.device.type == "meta":
+            continue
+        writer.add(name, param)
+
+    count = 0
+    bits = group_size = krot = 0
+    for layer_idx, layer in enumerate(tqdm(blocks, desc="Quantizing (streaming)")):
+        loader.materialize(layer, f"model.layers.{layer_idx}")
+
+        if get_named_moe_experts(layer):
+            raise NotImplementedError(
+                "Streaming convert supports per-linear quantization only; this model has fused-MoE "
+                "experts. Use the non-streaming path for it."
+            )
+
+        for name, module in get_named_linears(layer).items():
+            pt_file = result_dir / f"{layer_idx}.{name}.pt"
+            if not pt_file.exists():
+                continue  # not quantized: keep its fp16 weight as-is
+            sd = torch.load(pt_file, map_location="cpu", weights_only=False)
+            buffers, bits, group_size, krot = _quantize_layer(sd, device="cuda")
+            rl = RotateQuantizedLinear(
+                module.in_features,
+                module.out_features,
+                bias=module.bias is not None,
+                group_size=group_size,
+                bits=bits,
+                krot=krot,
+            )
+            rl.load_state_dict(buffers, strict=False)
+            set_module_by_name(layer, name, rl)
+            count += 1
+
+        for tname, tensor in layer.state_dict().items():
+            writer.add(f"model.layers.{layer_idx}.{tname}", tensor)
+
+        loader.release(layer)
+        torch.cuda.empty_cache()
+
+    writer.finalize()
+
+    if count == 0:
+        return 0, None
+    quant_config = {"quant_method": "paroquant", "bits": bits, "group_size": group_size, "krot": krot}
+    return count, quant_config
+
+
 @torch.no_grad()
 def main() -> None:
     parser = ArgumentParser()
@@ -491,16 +612,41 @@ def main() -> None:
     parser.add_argument("--result-dir", type=str, required=True)
     parser.add_argument("--output-path", type=str, required=True)
     parser.add_argument("--mode", choices=["real", "pseudo"], default="real")
+    parser.add_argument(
+        "--stream-from-disk",
+        action="store_true",
+        help="Stream layers from disk and write a quantized-only, sharded export. "
+        "Required for models too large to load into host RAM (real mode only).",
+    )
     args = parser.parse_args()
 
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA required.")
+    if args.mode != "real" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA required for pseudo mode.")
 
     result_dir = Path(args.result_dir)
     if not result_dir.is_dir():
         raise FileNotFoundError(f"Result directory not found: {result_dir}")
 
     source_dir = _resolve_source_dir(args.model)
+
+    if args.stream_from_disk:
+        if args.mode != "real":
+            raise ValueError("--stream-from-disk is only supported with --mode real")
+        logger.info("Streaming convert from disk (quantized-only, sharded export).")
+        output_path = Path(args.output_path)
+        output_path.mkdir(parents=True, exist_ok=True)
+        _remove_safetensor_files(output_path)
+        count, quant_config = _convert_real_streaming(source_dir, result_dir, output_path)
+        if count == 0:
+            raise RuntimeError(f"No checkpoint files matched in {result_dir}")
+        source_non_md = _copy_source_non_md_files(source_dir, output_path)
+        _prune_non_md_extras(output_path, source_non_md)
+        _write_config_json(source_dir, output_path, quant_config)
+        if not any(_is_safetensor_related(p) for p in output_path.rglob("*") if p.is_file()):
+            raise RuntimeError("No safetensors artifacts were generated.")
+        print(f"Converted {count} layers (real, streaming) → {output_path}")
+        return
+
     model = _load_model(str(source_dir), device_map="cpu" if args.mode == "real" else "cuda")
 
     quant_config: dict[str, Any] | None = None
@@ -523,6 +669,15 @@ def main() -> None:
         # during save_pretrained(), which breaks PARO module-key matching on
         # reload. Save the already-complete real state_dict directly instead.
         assert save_state_dict is not None
+        # Decouple shared tensors (e.g. tie_word_embeddings) before saving;
+        # safetensors rejects state_dicts where multiple keys share storage.
+        seen_ptrs: set[int] = set()
+        deduped: dict = {}
+        for k, v in list(save_state_dict.items()):
+            ptr = v.data_ptr()
+            deduped[k] = v if ptr not in seen_ptrs else v.clone()
+            seen_ptrs.add(ptr)
+        save_state_dict = deduped
         save_safetensors(save_state_dict, output_path / "model.safetensors", metadata={"format": "pt"})
     else:
         model.save_pretrained(output_path, safe_serialization=True, state_dict=save_state_dict)

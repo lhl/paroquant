@@ -16,38 +16,29 @@ from .util import CosineAnnealingParam, RETAINED_KWARG_KEYS, logger, to_device
 def _get_independent_channel_pairs(
     pairs: torch.Tensor, dim: int, num_rotations: int, num_pairs_each: int
 ) -> list[list[tuple[int, int]]]:
+    # Greedily select independent channel pairs per rotation. Originally this
+    # tracked availability in (dim, dim) torch matrices, zeroing whole rows/cols
+    # per selection; the same greedy choices are reproduced here with O(1)
+    # Python set lookups, avoiding pathologically slow torch scalar indexing.
     pairs = pairs.cpu().tolist()
     rotations_pairs = []
-    # Record the available pairs in a matrix.
-    available = torch.ones(dim, dim)
-    available.fill_diagonal_(0)
+    # Specific (i, j) pairs already consumed in an earlier rotation.
+    consumed: set[tuple[int, int]] = set()
 
     for _ in range(num_rotations):
-        independent_pairs = []
-        # We use a copy to track the available pairs in this rotation.
-        # It's different from the original available matrix.
-        available_in_rotation = available.clone()
-        # Greedily select pairs that are independent
+        independent_pairs: list[tuple[int, int]] = []
+        # Indices already used by a selected pair in this rotation. Selecting
+        # (i, j) blocks any pair sharing i or j for the rest of the rotation.
+        used_idx: set[int] = set()
         for i, j in pairs:
             if len(independent_pairs) == num_pairs_each:
                 break
-            if available_in_rotation[i, j] == 0:
+            if (i, j) in consumed or i in used_idx or j in used_idx:
                 continue
-            # Simply select the first available pair.
             independent_pairs.append((i, j))
-            # Selecting (i, j) in this rotation prohibits
-            # selecting any other pairs that share i or j
-            # in this rotation.
-            available_in_rotation[i, :] = 0
-            available_in_rotation[j, :] = 0
-            available_in_rotation[:, i] = 0
-            available_in_rotation[:, j] = 0
-            # Mark the pair as unavailable for future selections.
-            # i and j are still available for any other pairs
-            # in next rotations.
-            available[i, j] = 0
-            available[j, i] = 0
-
+            used_idx.add(i)
+            used_idx.add(j)
+            consumed.add((i, j))
         rotations_pairs.append(independent_pairs)
 
     return rotations_pairs
