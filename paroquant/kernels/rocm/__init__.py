@@ -174,16 +174,80 @@ def _load_rotation_extension():
     if not torch.cuda.is_available():
         raise RuntimeError("ParoQuant ROCm rotation requires a visible HIP device")
 
-    arch = os.environ.get("PAROQUANT_HIP_ARCH", "gfx1100")
+    arch = os.environ.get("PAROQUANT_HIP_ARCH")
+    if arch is None:
+        # A visible HIP device is guaranteed by the checks above.
+        arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
     os.environ.setdefault("PYTORCH_ROCM_ARCH", arch)
     build_dir = _rotation_build_directory(arch)
+    # On NixOS the bundled pip-ROCm clang can't find the standard C++/glibc and
+    # ROCm Thrust headers. Discover them from the nix store (each overridable via
+    # the matching PAROQUANT_* env var) and pass them as -isystem includes. On
+    # non-NixOS systems nothing matches and the toolchain's default search paths
+    # are used unchanged.
+    import glob as _glob
+
+    def _discover(env_var: str, pattern: str) -> str | None:
+        override = os.environ.get(env_var)
+        if override:
+            return override
+        hits = _glob.glob(pattern)
+        return sorted(hits)[-1] if hits else None
+
+    nix_cxx = _discover("PAROQUANT_GCC_CXX_INCLUDE", "/nix/store/*gcc-prefix*/include/c++")
+    nix_glibc = _discover("PAROQUANT_GLIBC_INCLUDE", "/nix/store/*glibc*-dev/include")
+    nix_thrust = _discover("PAROQUANT_ROCTHRUST_INCLUDE", "/nix/store/*rocthrust*/include")
+    nix_rocprim = _discover("PAROQUANT_ROCPRIM_INCLUDE", "/nix/store/*rocprim*/include")
+
+    # Stub headers for ROCm libs not installed on NixOS (hipsparse, hipblas,
+    # hipblaslt, hipsolver), needed by ATen/hip/HIPContextLight.h but not by the
+    # paroquant kernel itself.
+    _stubs = Path(__file__).parents[3] / "rocm_stubs"
+    nix_rocm_stubs = str(_stubs) if _stubs.is_dir() else None
+
+    extra_cxx_includes: list[str] = []
+    if nix_cxx:
+        extra_cxx_includes.append(f"-isystem{nix_cxx}")
+        # Target-triple subdir holds bits/c++config.h (triple varies by host).
+        triples = _glob.glob(f"{nix_cxx}/*-linux-gnu")
+        if triples:
+            extra_cxx_includes.append(f"-isystem{sorted(triples)[-1]}")
+    for inc in (nix_glibc, nix_thrust, nix_rocprim, nix_rocm_stubs):
+        if inc:
+            extra_cxx_includes.append(f"-isystem{inc}")
+
+    # Link-time search path for system ROCm libs (not under /opt/rocm on NixOS).
+    extra_ldflags: list[str] = []
+    lib_dir = os.environ.get("PAROQUANT_ROCM_LIB_DIR", "/run/current-system/sw/lib")
+    if Path(lib_dir).is_dir():
+        extra_ldflags += [f"-L{lib_dir}", f"-Wl,-rpath,{lib_dir}"]
+
+    # Ensure ninja (installed in the venv) is on PATH for torch's cpp_extension.
+    _this_python_bin = str(Path(sys.executable).parent)
+    _cur_path = os.environ.get("PATH", "")
+    if _this_python_bin not in _cur_path.split(os.pathsep):
+        os.environ["PATH"] = _this_python_bin + os.pathsep + _cur_path
+
+    # torch.utils.cpp_extension.ROCM_HOME is resolved at import time via
+    # shutil.which('hipcc').  When the venv's bin isn't in PATH at import time,
+    # it falls back to the system NixOS hipcc which lacks the ROCm device library.
+    # Patch ROCM_HOME to point at the venv root so the venv's hipcc wrapper is used.
+    import torch.utils.cpp_extension as _tce
+    _venv_root = str(Path(sys.executable).parent.parent)
+    _venv_hipcc = Path(_venv_root) / "bin" / "hipcc"
+    if _venv_hipcc.exists() and _tce.ROCM_HOME != _venv_root:
+        _tce.ROCM_HOME = _venv_root
+        _tce.HIP_HOME = os.path.join(_venv_root, "hip")
+        _tce.IS_HIP_EXTENSION = True
+
     load_kwargs = dict(
         name=f"paroquant_rotation_rocm_{arch}",
         cpp_sources="",
         cuda_sources=_ROCM_SRC,
         build_directory=str(build_dir),
-        extra_cflags=["-O3", "-std=c++17"],
-        extra_cuda_cflags=["-O3", f"--offload-arch={arch}", "-mcumode"],
+        extra_cflags=["-O3", "-std=c++17"] + extra_cxx_includes,
+        extra_cuda_cflags=["-O3", f"--offload-arch={arch}", "-mcumode"] + extra_cxx_includes,
+        extra_ldflags=extra_ldflags,
         with_cuda=True,
         verbose=bool(int(os.environ.get("PAROQUANT_VERBOSE_BUILD", "0"))),
     )

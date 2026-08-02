@@ -7,9 +7,20 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
-from transformers.integrations.moe import ALL_EXPERTS_FUNCTIONS
+try:
+    from transformers.integrations.moe import ALL_EXPERTS_FUNCTIONS
+except (ImportError, ModuleNotFoundError):
+    class _EmptyExperts:
+        def get_interface(self, name):
+            return None
+    ALL_EXPERTS_FUNCTIONS = _EmptyExperts()
 
-from paroquant.kernels.cuda import scaled_pairwise_rotation
+try:
+    from paroquant.kernels.cuda import scaled_pairwise_rotation
+except Exception as e:
+    scaled_pairwise_rotation = None
+    import sys
+    print(f"[paroquant] CUDA kernels unavailable (convert-only mode OK): {e}", file=sys.stderr)
 
 from .quantizer import UniformAffineQuantizer
 

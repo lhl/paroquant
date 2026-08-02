@@ -7,7 +7,10 @@ from torch.utils.checkpoint import checkpoint
 from .util import get_named_linears
 from .quantizer import UniformAffineQuantizer
 
-from paroquant.kernels.cuda import scaled_pairwise_rotation
+try:
+    from paroquant.kernels.cuda import scaled_pairwise_rotation
+except Exception:
+    scaled_pairwise_rotation = None
 
 
 class PseudoQuantizedLinear(nn.Module):
